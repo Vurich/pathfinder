@@ -8,21 +8,23 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use glutin::dpi::LogicalSize;
+use glutin::event::{Event, KeyboardInput, VirtualKeyCode, WindowEvent};
+use glutin::event_loop::{ControlFlow, EventLoop};
+use glutin::window::WindowBuilder;
+use glutin::{ContextBuilder, GlProfile, GlRequest};
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::transform2d::Transform2F;
-use pathfinder_geometry::vector::{Vector2F, vec2f, vec2i};
+use pathfinder_geometry::vector::{vec2f, vec2i, Vector2F};
 use pathfinder_gl::{GLDevice, GLVersion};
 use pathfinder_renderer::concurrent::rayon::RayonExecutor;
 use pathfinder_renderer::concurrent::scene_proxy::SceneProxy;
-use pathfinder_renderer::gpu::renderer::Renderer;
 use pathfinder_renderer::gpu::options::{DestFramebuffer, RendererMode, RendererOptions};
-use pathfinder_renderer::options::{RenderTransform, BuildOptions};
-use pathfinder_resources::ResourceLoader;
-use pathfinder_resources::embedded::EmbeddedResourceLoader;
-use sdl2::event::Event;
-use sdl2::keyboard::Keycode;
-use sdl2::video::GLProfile;
+use pathfinder_renderer::gpu::renderer::Renderer;
+use pathfinder_renderer::options::{BuildOptions, RenderTransform};
 use pathfinder_renderer::scene::Scene;
+use pathfinder_resources::embedded::EmbeddedResourceLoader;
+use pathfinder_resources::ResourceLoader;
 use pathfinder_swf::{draw_paths_into_scene, process_swf_tags};
 use std::env;
 use std::fs::read;
@@ -35,8 +37,8 @@ fn main() {
         match read(path) {
             Ok(bytes) => {
                 swf_bytes = bytes;
-            },
-            Err(e) => panic!(e)
+            }
+            Err(e) => panic!(e),
         }
     } else {
         // NOTE(jon): This is a version of the ghostscript tiger graphic flattened to a single
@@ -67,51 +69,55 @@ fn main() {
     let (_, movie): (_, swf_types::Movie) =
         swf_parser::streaming::movie::parse_movie(&swf_bytes[..]).unwrap();
 
-    // Set up SDL2.
-    let sdl_context = sdl2::init().unwrap();
-    let video = sdl_context.video().unwrap();
-
-    // Make sure we have at least a GL 3.0 context. Pathfinder requires this.
-    let gl_attributes = video.gl_attr();
-    gl_attributes.set_context_profile(GLProfile::Core);
-    gl_attributes.set_context_version(3, 3);
-
     // process swf scene
     // TODO(jon): Since swf is a streaming format, this really wants to be a lazy iterator over
     // swf frames eventually.
     let (library, stage) = process_swf_tags(&movie);
 
-    // Open a window.
+    // Calculate the right logical size of the window.
+    let event_loop = EventLoop::new();
     let window_size = vec2i(stage.width(), stage.height());
-    let window = video.window("Minimal example", window_size.x() as u32, window_size.y() as u32)
-        .opengl()
-        .allow_highdpi()
-        .build()
+    let logical_window_size = LogicalSize::new(window_size.x(), window_size.y());
+
+    // Open a window.
+    let window_builder = WindowBuilder::new()
+        .with_title("Minimal example")
+        .with_inner_size(logical_window_size);
+
+    // Create an OpenGL 3.x context for Pathfinder to use.
+    let gl_context = ContextBuilder::new()
+        .with_gl(GlRequest::Latest)
+        .with_gl_profile(GlProfile::Core)
+        .build_windowed(window_builder, &event_loop)
         .unwrap();
 
-    let pixel_size = vec2i(window.drawable_size().0 as i32, window.drawable_size().1 as i32);
-    let device_pixel_ratio = pixel_size.x() as f32 / window_size.x() as f32;
+    // Load OpenGL, and make the context current.
+    let gl_context = unsafe { gl_context.make_current().unwrap() };
+    gl::load_with(|name| gl_context.get_proc_address(name) as *const _);
 
-    // Create the GL context, and make it current.
-    let gl_context = window.gl_create_context().unwrap();
-    gl::load_with(|name| video.gl_get_proc_address(name) as *const _);
-    window.gl_make_current(&gl_context).unwrap();
+    let physical_size = gl_context.window().inner_size();
 
     // Create a Pathfinder renderer.
     let device = GLDevice::new(GLVersion::GL3, 0);
     let mode = RendererMode::default_for_device(&device);
     let options = RendererOptions {
         background_color: Some(stage.background_color()),
-        dest: DestFramebuffer::full_window(pixel_size),
+        dest: DestFramebuffer::full_window(vec2i(
+            physical_size.width as i32,
+            physical_size.height as i32,
+        )),
         ..RendererOptions::default()
     };
-    let mut renderer = Renderer::new(device, &resource_loader, mode, options);
+    let mut renderer = Renderer::new(device, &EmbeddedResourceLoader, mode, options);
+
+    let device_pixel_ratio = physical_size.width as f32 / stage.width() as f32;
 
     // Clear to swf stage background color.
     let mut scene = Scene::new();
-    scene.set_view_box(RectF::new(Vector2F::zero(),
-                                  vec2f(stage.width() as f32,
-                                        stage.height() as f32) * device_pixel_ratio));
+    scene.set_view_box(RectF::new(
+        Vector2F::zero(),
+        vec2f(stage.width() as f32, stage.height() as f32) * device_pixel_ratio,
+    ));
     draw_paths_into_scene(&library, &mut scene);
 
     // Render the canvas to screen.
@@ -119,15 +125,60 @@ fn main() {
     let mut build_options = BuildOptions::default();
     let scale_transform = Transform2F::from_scale(device_pixel_ratio);
     build_options.transform = RenderTransform::Transform2D(scale_transform);
-    scene.build_and_render(&mut renderer, build_options);
+    scene.build_and_render(&mut renderer, build_options.clone());
+    println!("{:?}", renderer.last_rendering_time());
 
-    window.gl_swap_window();
-    // Wait for a keypress.
-    let mut event_pump = sdl_context.event_pump().unwrap();
-    loop {
-        match event_pump.wait_event() {
-            Event::Quit {..} | Event::KeyDown { keycode: Some(Keycode::Escape), .. } => return,
+    gl_context.swap_buffers().unwrap();
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Poll;
+
+        match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            }
+            | Event::WindowEvent {
+                event:
+                    WindowEvent::KeyboardInput {
+                        input:
+                            KeyboardInput {
+                                virtual_keycode: Some(VirtualKeyCode::Escape),
+                                ..
+                            },
+                        ..
+                    },
+                ..
+            } => {
+                *control_flow = ControlFlow::Exit;
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(physical_size),
+                ..
+            } => {
+                let device_pixel_ratio = physical_size.width as f32 / stage.width() as f32;
+
+                gl_context.resize(physical_size);
+
+                renderer.options_mut().dest = DestFramebuffer::full_window(vec2i(
+                    physical_size.width as i32,
+                    physical_size.height as i32,
+                ));
+                renderer.dest_framebuffer_size_changed();
+
+                let scale_transform = Transform2F::from_scale(device_pixel_ratio);
+                build_options.transform = RenderTransform::Transform2D(scale_transform);
+                scene.set_view_box(RectF::new(
+                    Vector2F::zero(),
+                    vec2f(stage.width() as f32, stage.height() as f32) * device_pixel_ratio,
+                ));
+            }
+            Event::RedrawRequested(_) => {
+                scene.build_and_render(&mut renderer, build_options.clone());
+                println!("{:?}", renderer.last_rendering_time());
+
+                gl_context.swap_buffers().unwrap();
+            }
             _ => {}
         }
-    }
+    });
 }
